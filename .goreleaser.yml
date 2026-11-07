@@ -1,0 +1,23 @@
+version: 2
+
+# otelkit is a library: there is no binary to build. GoReleaser publishes the
+# release notes and a source archive for every tag; `go get` does the rest.
+builds:
+  - skip: true
+
+source:
+  enabled: true
+  format: tar.gz
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  prerelease: auto

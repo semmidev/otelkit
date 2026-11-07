@@ -1,0 +1,40 @@
+name: otelkit-example
+
+services:
+  openobserve:
+    image: openobserve/openobserve:latest
+    restart: unless-stopped
+    ports:
+      - "5080:5080"
+    environment:
+      ZO_ROOT_USER_EMAIL: "root@example.com"
+      ZO_ROOT_USER_PASSWORD: "Complexpass#123"
+      ZO_DATA_DIR: /data
+    volumes:
+      - openobserve-data:/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - openobserve
+    ports:
+      - "8080:8080"
+    environment:
+      ADDR: ":8080"
+      OTEL_SERVICE_NAME: otelkit-example
+      DEPLOYMENT_ENVIRONMENT: docker
+      OTEL_EXPORTER: otlp
+      # otelkit appends /v1/{logs,metrics,traces}; the header is Basic
+      # root@example.com:Complexpass#123 (URL-encoded for the OTLP SDK).
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://openobserve:5080/api/default
+      OTEL_EXPORTER_OTLP_HEADERS: "Authorization=Basic%20cm9vdEBleGFtcGxlLmNvbTpDb21wbGV4cGFzcyMxMjM="
+      OPENOBSERVE_URL: http://openobserve:5080
+      OPENOBSERVE_USER: "root@example.com"
+      OPENOBSERVE_PASSWORD: "Complexpass#123"
+      OPENOBSERVE_STREAM: example_logs
+
+volumes:
+  openobserve-data:
