@@ -30,6 +30,8 @@ call — then use the standard `otel` and `slog` APIs everywhere else.
   - [Telemetry methods](#telemetry-methods)
 - [Exporters](#exporters)
 - [Logging](#logging)
+  - [Wide events](#wide-events)
+  - [Sampling](#sampling)
 - [HTTP Instrumentation](#http-instrumentation)
 - [gRPC Instrumentation](#grpc-instrumentation)
 - [OpenObserve Client](#openobserve-client)
@@ -47,6 +49,7 @@ flowchart LR
         Code["otel.Tracer · otel.Meter · slog"]
         HTTP["HTTPHandler() · HTTPClient()"]
         GRPC["GRPCServerOption() · GRPCClientOption()"]
+        Log["logging.Middleware"]
         OBSDK["openobserve.Client"]
     end
 
@@ -71,6 +74,7 @@ flowchart LR
     Code --> Setup
     HTTP --> Providers
     GRPC --> Providers
+    Log -->|"slog bridge"| Providers
     Setup --> Resource --> Providers
     Providers --> OTLP
     Providers --> Stdout
@@ -83,7 +87,8 @@ flowchart LR
 
 `Setup` installs the providers once. From then on the application talks to the
 standard `otel` and `slog` APIs, while the HTTP and gRPC helpers add spans,
-metrics and propagation around each call. The `openobserve` package bypasses
+metrics and propagation around each call. The `logging` package adds one
+canonical request event on top of `slog`, and the `openobserve` package bypasses
 OTLP for the OpenObserve-only SQL and ingestion APIs.
 
 ## Features
@@ -93,6 +98,8 @@ OTLP for the OpenObserve-only SQL and ingestion APIs.
 - **Pluggable exporters** — OTLP/HTTP, stdout or no-op; works with an
   OpenTelemetry Collector, OpenObserve, Jaeger, Tempo or any OTLP backend.
 - **`slog` bridge** — logs automatically carry `trace_id` and `span_id`.
+- **Wide-event logging** — one canonical, queryable log event per request,
+  enriched as the handler runs, with tail sampling for healthy traffic.
 - **HTTP and gRPC helpers** — server spans, client spans, metrics and context
   propagation without touching handlers.
 - **OpenObserve client** — SQL search and JSON/bulk ingestion for the APIs that
@@ -220,7 +227,93 @@ slog.InfoContext(ctx, "order created", "order_id", "ord-1", "latency_ms", 15)
 ```
 
 With `ExporterNone`, otelkit falls back to a JSON handler on `Config.Writer`
-instead, which keeps local logs readable without an exporter.
+instead, which keeps local logs readable without an exporter. The fallback also
+adds `trace_id` and `span_id` when the context carries a span.
+
+### Wide events
+
+Scattered log lines are hard to query. The `logging` package emits one
+canonical event per request instead: middleware collects request context and
+business fields, then writes a single structured record when the handler
+returns.
+
+```go
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/semmidev/otelkit"
+	"github.com/semmidev/otelkit/logging"
+)
+
+mux := http.NewServeMux()
+mux.HandleFunc("POST /orders", func(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	logging.Add(ctx, "user_id", userID, "order_id", orderID)
+	logging.SetMessage(ctx, "order_created")
+
+	w.WriteHeader(http.StatusCreated)
+})
+
+// Place the logging middleware inside HTTPHandler so the server span is
+// active and the event carries trace_id and span_id.
+handler := otelkit.HTTPHandler(
+	logging.Middleware(mux, logging.Config{
+		Fields:    []slog.Attr{slog.String("service", "orders")},
+		SkipPaths: []string{"/healthz"},
+	}),
+	"orders",
+)
+```
+
+On failure, record the error and let the middleware choose the level:
+
+```go
+logging.SetMessage(ctx, "order_failed")
+logging.Error(ctx, err)
+```
+
+| Method | Description |
+| ------ | ----------- |
+| `Add(ctx, args...)` | Adds `slog`-style key/value pairs to the current event. |
+| `AddAttrs(ctx, attrs...)` | Adds typed `slog.Attr` values without boxing. |
+| `Error(ctx, err)` | Adds an `error` group with `type` and `message`. |
+| `SetMessage(ctx, msg)` | Overrides the event message for this request. |
+
+The middleware adds `http.method`, `http.path`, `http.route`, `http.status`,
+`http.bytes`, `duration_ms`, `outcome` and `request_id` (from `X-Request-ID`).
+The level is `ERROR` for errors and 5xx, `WARN` for 4xx and `INFO` otherwise.
+
+`logging.Config` controls the event:
+
+| Field | Default | Description |
+| ----- | ------- | ----------- |
+| `Logger` | `slog.Default()` | Destination logger. Read at emit time. |
+| `Message` | `request_completed` | Default event message. |
+| `Fields` | — | Static attributes added to every event. |
+| `HealthySampleRate` | `0` (keep all) | Samples successful requests; `(0,1)` keeps a fraction. |
+| `SlowThreshold` | `0` (disabled) | Always keeps events at or above this duration. |
+| `KeepPaths` | — | Always keeps paths with these prefixes. |
+| `SkipPaths` | — | Skips paths with these prefixes, for example `/healthz`. |
+
+`SkipPaths` is checked first, so a skipped path is never logged even if it also
+matches `KeepPaths`.
+
+### Sampling
+
+Errors, 5xx responses, slow requests and `KeepPaths` are always kept. Healthy
+requests follow `HealthySampleRate`, so `0` or `1` keeps everything and `0.05`
+keeps about 5%. This is tail sampling: the decision is made after the handler
+returns, using the final status, duration and error.
+
+```go
+logging.Middleware(mux, logging.Config{
+	HealthySampleRate: 0.05,
+	SlowThreshold:     500 * time.Millisecond,
+	KeepPaths:         []string{"/admin", "/checkout"},
+})
+```
 
 ## HTTP Instrumentation
 
@@ -305,8 +398,8 @@ Non-2xx responses return a typed `*openobserve.APIError` with `StatusCode`,
 
 A complete demo lives in [`example/`](example/README.md): three simulated
 microservices (gateway, orders, users) in one `main.go`, each on its own port,
-with trace context propagated across every hop. It also shows the `slog`
-bridge, custom spans and metrics, the OpenObserve client, and a Docker Compose
+with trace context propagated across every hop. It also shows wide-event `slog`
+logging, custom spans and metrics, the OpenObserve client, and a Docker Compose
 stack that runs OpenObserve and the API together.
 
 ```bash

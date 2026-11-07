@@ -24,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Telemetry owns the configured providers. Call Shutdown when the process
@@ -90,7 +91,8 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	))
 
 	if cfg.Exporter == ExporterNone {
-		slog.SetDefault(slog.New(slog.NewJSONHandler(cfg.Writer, &slog.HandlerOptions{Level: slog.LevelInfo})))
+		handler := contextHandler{Handler: slog.NewJSONHandler(cfg.Writer, &slog.HandlerOptions{Level: slog.LevelInfo})}
+		slog.SetDefault(slog.New(handler))
 	} else {
 		slog.SetDefault(slog.New(otelslog.NewHandler(cfg.ServiceName,
 			otelslog.WithLoggerProvider(lp),
@@ -99,6 +101,30 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	}
 
 	return &Telemetry{TracerProvider: tp, MeterProvider: mp, LoggerProvider: lp}, nil
+}
+
+// contextHandler adds trace identifiers to the JSON fallback so local logs
+// match the records exported through the OpenTelemetry bridge.
+type contextHandler struct {
+	slog.Handler
+}
+
+func (h contextHandler) Handle(ctx context.Context, record slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		record.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
+func (h contextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return contextHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h contextHandler) WithGroup(name string) slog.Handler {
+	return contextHandler{Handler: h.Handler.WithGroup(name)}
 }
 
 // Shutdown flushes and shuts down all providers. It is safe to call more than

@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/semmidev/otelkit"
+	"github.com/semmidev/otelkit/logging"
 	"github.com/semmidev/otelkit/openobserve"
 )
 
@@ -126,8 +127,8 @@ func (s *server) shutdown(ctx context.Context) error {
 
 func gatewayHandler(client *http.Client, usersURL, ordersURL string, obs *openobserve.Client, requests metric.Int64Counter) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(r.Context(), w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	mux.HandleFunc("GET /api/users", func(w http.ResponseWriter, r *http.Request) {
@@ -147,30 +148,36 @@ func gatewayHandler(client *http.Client, usersURL, ordersURL string, obs *openob
 	})
 
 	mux.HandleFunc("POST /api/logs", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		if obs == nil {
-			writeError(w, http.StatusServiceUnavailable, "OPENOBSERVE_URL is not configured")
+			writeError(ctx, w, http.StatusServiceUnavailable, "OPENOBSERVE_URL is not configured")
 			return
 		}
 
 		var row map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&row); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
+			logging.Error(ctx, err)
+			writeError(ctx, w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
 		row["_timestamp"] = time.Now().UnixMicro()
 
-		res, err := obs.IngestJSON(r.Context(), env("OPENOBSERVE_STREAM", "example_logs"), []map[string]any{row})
+		stream := env("OPENOBSERVE_STREAM", "example_logs")
+		logging.Add(ctx, "stream", stream, "rows", 1)
+		res, err := obs.IngestJSON(ctx, stream, []map[string]any{row})
 		if err != nil {
-			trace.SpanFromContext(r.Context()).RecordError(err)
-			writeError(w, http.StatusBadGateway, "ingest failed")
+			logging.Error(ctx, err)
+			trace.SpanFromContext(ctx).RecordError(err)
+			writeError(ctx, w, http.StatusBadGateway, "ingest failed")
 			return
 		}
-		writeJSON(w, http.StatusOK, res)
+		writeJSON(ctx, w, http.StatusOK, res)
 	})
 
 	mux.HandleFunc("GET /api/search", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		if obs == nil {
-			writeError(w, http.StatusServiceUnavailable, "OPENOBSERVE_URL is not configured")
+			writeError(ctx, w, http.StatusServiceUnavailable, "OPENOBSERVE_URL is not configured")
 			return
 		}
 
@@ -178,24 +185,31 @@ func gatewayHandler(client *http.Client, usersURL, ordersURL string, obs *openob
 		if sql == "" {
 			sql = "SELECT * FROM example_logs ORDER BY _timestamp DESC LIMIT 20"
 		}
-		res, err := obs.Search(r.Context(), sql, openobserve.SearchOptions{Size: 20})
+		logging.Add(ctx, "sql", sql)
+		res, err := obs.Search(ctx, sql, openobserve.SearchOptions{Size: 20})
 		if err != nil {
-			trace.SpanFromContext(r.Context()).RecordError(err)
-			writeError(w, http.StatusBadGateway, "search failed")
+			logging.Error(ctx, err)
+			trace.SpanFromContext(ctx).RecordError(err)
+			writeError(ctx, w, http.StatusBadGateway, "search failed")
 			return
 		}
-		writeJSON(w, http.StatusOK, res)
+		logging.Add(ctx, "hits", res.Total, "took_ms", res.Took)
+		writeJSON(ctx, w, http.StatusOK, res)
 	})
 
-	// Health checks are noise in a trace backend; keep them out of telemetry.
-	return otelkit.HTTPHandler(mux, "gateway",
+	// Health checks are noise; keep them out of traces and wide events.
+	return otelkit.HTTPHandler(logging.Middleware(mux, logging.Config{
+		Fields:    []slog.Attr{slog.String("service", "gateway")},
+		SkipPaths: []string{"/healthz"},
+	}), "gateway",
 		otelhttp.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/healthz" }))
 }
 
 func usersHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /users", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, []user{
+	mux.HandleFunc("GET /users", func(w http.ResponseWriter, r *http.Request) {
+		logging.Add(r.Context(), "users_returned", 2)
+		writeJSON(r.Context(), w, http.StatusOK, []user{
 			{ID: 1, Name: "Budi"},
 			{ID: 2, Name: "Siti"},
 		})
@@ -203,13 +217,16 @@ func usersHandler() http.Handler {
 	mux.HandleFunc("GET /users/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.Atoi(r.PathValue("id"))
 		if err != nil || id < 1 {
-			writeError(w, http.StatusBadRequest, "invalid user id")
+			logging.Add(r.Context(), "invalid_user_id", r.PathValue("id"))
+			writeError(r.Context(), w, http.StatusBadRequest, "invalid user id")
 			return
 		}
-		slog.InfoContext(r.Context(), "fetching user", "user_id", id)
-		writeJSON(w, http.StatusOK, user{ID: id, Name: "Budi"})
+		logging.Add(r.Context(), "user_id", id)
+		writeJSON(r.Context(), w, http.StatusOK, user{ID: id, Name: "Budi"})
 	})
-	return otelkit.HTTPHandler(mux, "users")
+	return otelkit.HTTPHandler(logging.Middleware(mux, logging.Config{
+		Fields: []slog.Attr{slog.String("service", "users")},
+	}), "users")
 }
 
 func ordersHandler(client *http.Client, usersURL string, requests, created metric.Int64Counter, latency metric.Float64Histogram) http.Handler {
@@ -224,9 +241,10 @@ func ordersHandler(client *http.Client, usersURL string, requests, created metri
 		start := time.Now()
 		u, err := loadUser(ctx, client, usersURL)
 		if err != nil {
+			logging.SetMessage(ctx, "order_failed")
+			logging.Error(ctx, err)
 			trace.SpanFromContext(ctx).RecordError(err)
-			slog.ErrorContext(ctx, "load user", "error", err)
-			writeError(w, http.StatusBadGateway, "users service unavailable")
+			writeError(ctx, w, http.StatusBadGateway, "users service unavailable")
 			return
 		}
 
@@ -235,15 +253,18 @@ func ordersHandler(client *http.Client, usersURL string, requests, created metri
 		latency.Record(ctx, latencyMs, metric.WithAttributes(attribute.String("service", "orders")))
 		created.Add(ctx, 1, metric.WithAttributes(attribute.String("service", "orders")))
 
-		slog.InfoContext(ctx, "order created", "user_id", u.ID, "latency_ms", latencyMs)
-		writeJSON(w, http.StatusCreated, map[string]any{
+		logging.Add(ctx, "user_id", u.ID, "order_id", "ord-1", "latency_ms", latencyMs)
+		logging.SetMessage(ctx, "order_created")
+		writeJSON(ctx, w, http.StatusCreated, map[string]any{
 			"order_id":   "ord-1",
 			"user_id":    u.ID,
 			"status":     "confirmed",
 			"latency_ms": latencyMs,
 		})
 	})
-	return otelkit.HTTPHandler(mux, "orders")
+	return otelkit.HTTPHandler(logging.Middleware(mux, logging.Config{
+		Fields: []slog.Attr{slog.String("service", "orders")},
+	}), "orders")
 }
 
 type user struct {
@@ -257,6 +278,7 @@ func loadUser(ctx context.Context, client *http.Client, usersURL string) (user, 
 	ctx, span := otel.Tracer("orders").Start(ctx, "load-user")
 	defer span.End()
 
+	logging.Add(ctx, "upstream", "users")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usersURL+"/users/1", http.NoBody)
 	if err != nil {
 		return user{}, err
@@ -275,25 +297,31 @@ func loadUser(ctx context.Context, client *http.Client, usersURL string) (user, 
 }
 
 func proxy(w http.ResponseWriter, r *http.Request, client *http.Client, method, target string) {
-	req, err := http.NewRequestWithContext(r.Context(), method, target, r.Body)
+	ctx := r.Context()
+	logging.Add(ctx, "upstream", target)
+
+	req, err := http.NewRequestWithContext(ctx, method, target, r.Body)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "build upstream request")
+		logging.Error(ctx, err)
+		writeError(ctx, w, http.StatusInternalServerError, "build upstream request")
 		return
 	}
 	req.Header = r.Header.Clone()
 
 	resp, err := client.Do(req)
 	if err != nil {
-		trace.SpanFromContext(r.Context()).RecordError(err)
-		writeError(w, http.StatusBadGateway, "upstream unavailable")
+		logging.Error(ctx, err)
+		trace.SpanFromContext(ctx).RecordError(err)
+		writeError(ctx, w, http.StatusBadGateway, "upstream unavailable")
 		return
 	}
 	defer resp.Body.Close()
 
+	logging.Add(ctx, "upstream_status", resp.StatusCode)
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		slog.WarnContext(r.Context(), "copy upstream response", "error", err)
+		logging.Error(ctx, err)
 	}
 }
 
@@ -311,16 +339,16 @@ func newOpenObserve() (*openobserve.Client, error) {
 	})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(ctx context.Context, w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("encode response", "error", err)
+		logging.Error(ctx, err)
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func writeError(ctx context.Context, w http.ResponseWriter, status int, message string) {
+	writeJSON(ctx, w, status, map[string]string{"error": message})
 }
 
 func env(key, fallback string) string {

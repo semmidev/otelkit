@@ -1,0 +1,3 @@
+- https://loggingsucks.com/
+- https://saybackend.com/blog/happycontext-wide-logging-golang/
+- https://github.com/happytoolin/unolog

@@ -28,6 +28,7 @@ produces one connected trace.
 - [Environment Variables](#environment-variables)
 - [Try It](#try-it)
 - [See the Trace](#see-the-trace)
+- [Logs](#logs)
 - [How It Uses otelkit](#how-it-uses-otelkit)
 - [Layout](#layout)
 - [Troubleshooting](#troubleshooting)
@@ -54,7 +55,8 @@ flowchart TB
 All three services live in `main.go` and share one `otelkit.Setup` call, so every
 span, metric and log is exported through the same OTLP pipeline. The calls
 between services use `otelkit.HTTPClient()`, so the W3C `traceparent` header is
-injected and extracted automatically.
+injected and extracted automatically. Each service also wraps its mux with
+`logging.Middleware`, which emits one canonical log event per request.
 
 Because the services share one process, they also share the demo resource, so
 `service.name` is `otelkit-example` for every span. The instrumentation scope
@@ -207,9 +209,46 @@ sequenceDiagram
 | `HTTP GET`              | client | orders        |
 | `GET /users/{id}`       | server | users         |
 
-Logs from all services are exported through the `slog` bridge with matching
-`trace_id` and `span_id`. Metrics `http.requests`, `orders.created` and
-`orders.latency` appear under **Metrics**.
+Logs are emitted as one canonical event per service hop; see [Logs](#logs).
+Metrics `http.requests`, `orders.created` and `orders.latency` appear under
+**Metrics**.
+
+## Logs
+
+`POST /api/orders` produces three canonical events, one from each service hop.
+They share the same `trace_id` and have different `span_id`, so filtering by
+`trace_id` in OpenObserve reconstructs the whole request.
+
+```json
+{
+  "time": "2026-11-07T10:23:45.612Z",
+  "level": "INFO",
+  "msg": "order_created",
+  "service": "orders",
+  "http.method": "POST",
+  "http.path": "/orders",
+  "user_id": 1,
+  "order_id": "ord-1",
+  "latency_ms": 16,
+  "upstream": "users",
+  "http.route": "POST /orders",
+  "http.status": 201,
+  "http.bytes": 83,
+  "duration_ms": 16.42,
+  "outcome": "success",
+  "trace_id": "...",
+  "span_id": "..."
+}
+```
+
+The middleware adds the request fields automatically. Handlers only add
+business context with `logging.Add`, `logging.Error` and `logging.SetMessage`.
+Errors, 5xx responses and slow requests are always kept; healthy traffic can be
+sampled with `logging.Config.HealthySampleRate`.
+
+In OpenObserve the OTel log body is stored as `body`, and attribute names are
+normalized with underscores (`http_status`, `http_route`, `trace_id`), so query
+those columns in the **Logs** view.
 
 ## How It Uses otelkit
 
@@ -222,10 +261,16 @@ telemetry, err := otelkit.Setup(ctx, otelkit.Config{
 })
 defer telemetry.Shutdown(ctx)
 
-// Every service gets server spans and metrics.
+// Every service gets server spans, metrics and one canonical log event.
 mux := http.NewServeMux()
 // ... routes ...
-handler := otelkit.HTTPHandler(mux, "orders")
+handler := otelkit.HTTPHandler(
+	logging.Middleware(mux, logging.Config{
+		Fields:    []slog.Attr{slog.String("service", "orders")},
+		SkipPaths: []string{"/healthz"},
+	}),
+	"orders",
+)
 
 // Every inter-service call propagates trace context.
 client := otelkit.HTTPClient()
@@ -235,8 +280,16 @@ resp, err := client.Do(req.WithContext(ctx))
 ctx, span := otel.Tracer("orders").Start(ctx, "load-user")
 defer span.End()
 
-// Logs carry trace_id and span_id through the slog bridge.
-slog.InfoContext(ctx, "order created", "user_id", u.ID)
+// Enrich the request event as the handler learns more.
+logging.Add(ctx, "user_id", u.ID, "order_id", "ord-1", "latency_ms", latencyMs)
+logging.SetMessage(ctx, "order_created")
+
+// On failure, record the error on the same event.
+logging.SetMessage(ctx, "order_failed")
+logging.Error(ctx, err)
+
+// Lifecycle logs still use slog directly.
+slog.Info("listening", "service", "orders", "addr", ":8082")
 ```
 
 The OpenObserve-specific calls use `github.com/semmidev/otelkit/openobserve`

@@ -61,6 +61,37 @@ func TestSetupNone(t *testing.T) {
 	}
 }
 
+func TestSetupNoneLogsTraceContext(t *testing.T) {
+	restoreGlobals(t)
+
+	var buf bytes.Buffer
+	tel, err := Setup(context.Background(), Config{
+		ServiceName: "test-service",
+		Exporter:    ExporterNone,
+		Writer:      &buf,
+	})
+	if err != nil {
+		t.Fatalf("Setup() error = %v", err)
+	}
+
+	ctx, span := tel.TracerProvider.Tracer("test").Start(context.Background(), "log-span")
+	slog.InfoContext(ctx, "with-span")
+	span.End()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tel.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	out := buf.String()
+	for _, want := range []string{`"trace_id"`, `"span_id"`, `"with-span"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output missing %q\noutput:\n%s", want, out)
+		}
+	}
+}
+
 func TestSetupStdout(t *testing.T) {
 	restoreGlobals(t)
 
