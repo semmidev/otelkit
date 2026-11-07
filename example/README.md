@@ -34,33 +34,27 @@ produces one connected trace.
 
 ## Architecture
 
-```text
-                         ┌──────────────────────────────┐
-                         │        gateway :8080         │
-                         │  HTTPHandler + OTLP export   │
-                         └───────┬──────────────┬───────┘
-                                 │              │
-              GET /api/users     │              │  POST /api/orders
-                                 ▼              ▼
-                    ┌────────────────┐   ┌────────────────┐
-                    │   users :8081  │   │  orders :8082  │
-                    │ HTTPHandler    │◄──┤ HTTPHandler    │
-                    └────────────────┘   │ + load-user    │
-                             ▲           └────────────────┘
-                             │  GET /users/1 (traceparent propagated)
-                             └───────────────────────────────────────────
+```mermaid
+flowchart TB
+    Client["Client · curl"] -->|"GET /api/users"| Gateway
+    Client -->|"POST /api/orders"| Gateway
+
+    subgraph Process["one process · one otelkit.Setup"]
+        Gateway["gateway :8080<br/>HTTPHandler"]
+        Orders["orders :8082<br/>HTTPHandler + load-user"]
+        Users["users :8081<br/>HTTPHandler"]
+        Gateway -->|"GET /api/users"| Users
+        Gateway -->|"POST /api/orders"| Orders
+        Orders -->|"GET /users/1<br/>traceparent propagated"| Users
+    end
+
+    Process -.->|"OTLP /v1/traces · /v1/metrics · /v1/logs"| OpenObserve["OpenObserve :5080"]
 ```
 
-All three services live in `main.go` and share one `otelkit.Setup` call. The
-calls between them use `otelkit.HTTPClient()`, so the W3C `traceparent` header
-is injected and extracted automatically:
-
-- `gateway` server span
-  - `HTTP POST` client span
-    - `orders` server span
-      - `load-user` custom span
-        - `HTTP GET` client span
-          - `users` server span
+All three services live in `main.go` and share one `otelkit.Setup` call, so every
+span, metric and log is exported through the same OTLP pipeline. The calls
+between services use `otelkit.HTTPClient()`, so the W3C `traceparent` header is
+injected and extracted automatically.
 
 Because the services share one process, they also share the demo resource, so
 `service.name` is `otelkit-example` for every span. The instrumentation scope
@@ -183,6 +177,26 @@ curl 'http://localhost:8080/api/search?sql=SELECT%20*%20FROM%20example_logs%20LI
 3. Open the trace created by `POST /api/orders`.
 
 The waterfall contains six spans across three services:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant GW as gateway
+    participant O as orders
+    participant U as users
+
+    C->>GW: POST /api/orders
+    Note over GW: server span
+    GW->>O: POST /orders (traceparent)
+    Note over O: server span
+    Note over O: load-user span
+    O->>U: GET /users/1 (HTTP GET client span)
+    Note over U: server span
+    U-->>O: user
+    O-->>GW: order created
+    GW-->>C: 201 Created
+```
 
 | Span                    | Kind   | Service scope |
 | ----------------------- | ------ | ------------- |

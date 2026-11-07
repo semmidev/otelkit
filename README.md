@@ -13,7 +13,7 @@ call — then use the standard `otel` and `slog` APIs everywhere else.
 [![Go Report Card](https://goreportcard.com/badge/github.com/semmidev/otelkit)](https://goreportcard.com/report/github.com/semmidev/otelkit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[Features](#features) · [Installation](#installation) · [Quick Start](#quick-start) · [Configuration](#configuration) · [Example](example/README.md)
+[Architecture](#architecture) · [Features](#features) · [Installation](#installation) · [Quick Start](#quick-start) · [Configuration](#configuration) · [Example](example/README.md)
 
 </div>
 
@@ -21,6 +21,7 @@ call — then use the standard `otel` and `slog` APIs everywhere else.
 
 ## Table of Contents
 
+- [Architecture](#architecture)
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -37,6 +38,53 @@ call — then use the standard `otel` and `slog` APIs everywhere else.
 - [Compatibility](#compatibility)
 - [Contributing](#contributing)
 - [License](#license)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph App["Application"]
+        Code["otel.Tracer · otel.Meter · slog"]
+        HTTP["HTTPHandler() · HTTPClient()"]
+        GRPC["GRPCServerOption() · GRPCClientOption()"]
+        OBSDK["openobserve.Client"]
+    end
+
+    subgraph Kit["otelkit"]
+        Setup["Setup(ctx, Config)"]
+        Resource["Resource + W3C TraceContext/Baggage"]
+        Providers["Tracer · Meter · Logger providers"]
+    end
+
+    subgraph Exporters["Exporters"]
+        OTLP["OTLP/HTTP"]
+        Stdout["stdout"]
+        None["none"]
+    end
+
+    subgraph Backends["Backends"]
+        Collector["OpenTelemetry Collector"]
+        OpenObserve["OpenObserve"]
+        Other["Jaeger · Tempo · Grafana"]
+    end
+
+    Code --> Setup
+    HTTP --> Providers
+    GRPC --> Providers
+    Setup --> Resource --> Providers
+    Providers --> OTLP
+    Providers --> Stdout
+    Providers --> None
+    OTLP --> Collector
+    OTLP --> OpenObserve
+    OTLP --> Other
+    OBSDK -->|"SQL search · JSON/bulk ingest"| OpenObserve
+```
+
+`Setup` installs the providers once. From then on the application talks to the
+standard `otel` and `slog` APIs, while the HTTP and gRPC helpers add spans,
+metrics and propagation around each call. The `openobserve` package bypasses
+OTLP for the OpenObserve-only SQL and ingestion APIs.
 
 ## Features
 
