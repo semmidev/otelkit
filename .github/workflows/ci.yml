@@ -45,7 +45,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go vet ./...
-      - run: go test -race ./...
+      - name: Test
+        shell: bash
+        run: go test -race ./... 2>&1 | tee test.log
+      - name: Test annotations
+        if: failure()
+        shell: bash
+        run: |
+          tail -n 40 test.log | while IFS= read -r line; do
+            echo "::error title=go test::$line"
+          done
       - name: Coverage
         if: runner.os == 'Linux'
         run: go test -coverprofile=coverage.out ./... && go tool cover -func=coverage.out | tail -1

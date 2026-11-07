@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
@@ -43,15 +44,25 @@ func TestGRPCInstrumentation(t *testing.T) {
 			t.Fatalf("status = %v, want SERVING", res.Status)
 		}
 
+		// The server span ends in the gRPC stats handler, which may run after
+		// the client call returns. Wait briefly for both sides to be exported.
+		deadline := time.Now().Add(2 * time.Second)
 		var client, server int
-		for _, span := range exp.GetSpans() {
-			switch span.SpanKind {
-			case trace.SpanKindClient:
-				client++
-			case trace.SpanKindServer:
-				server++
-			default:
+		for {
+			client, server = 0, 0
+			for _, span := range exp.GetSpans() {
+				switch span.SpanKind {
+				case trace.SpanKindClient:
+					client++
+				case trace.SpanKindServer:
+					server++
+				default:
+				}
 			}
+			if (client == 1 && server == 1) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
 		if client != 1 || server != 1 {
 			t.Fatalf("client spans = %d, server spans = %d, want 1 and 1", client, server)
